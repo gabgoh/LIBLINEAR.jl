@@ -35,6 +35,7 @@ immutable Problem
   y::Ptr{Float64} # target values
   x::Ptr{Ptr{FeatureNode}} # sparse rep. (array of feature_node) of one training vector
   bias::Float64 # if bias >= 0, isntance x becomes [x; bias]; if < 0, no bias term (default -1)
+  W::Ptr{Float64}
 end
 
 immutable Parameter
@@ -55,6 +56,9 @@ immutable Model
   w::Ptr{Float64}
   label::Ptr{Cint} # label of each class
   bias::Float64
+  numSV::Ptr{Cint}
+  SV::Ptr{Float64}
+  SVI::Ptr{Cint}
 end
 
 # model in julia
@@ -66,6 +70,9 @@ type LinearModel{T}
   _labels::Vector{Cint}
   labels::Vector{T}
   bias::Float64
+  numSV::Cint
+  SV::Vector
+  SVI::Vector
 end
 
 # get library
@@ -195,13 +202,14 @@ function instances2nodes{U<:Real}(instances::SparseMatrixCSC{U})
 end
 
 # train
-function linear_train{T, U<:Real}(
-          labels::AbstractVector{T},
-          instances::AbstractMatrix{U};
+function linear_train{Float64, U<:Real}(
+          labels::AbstractVector{Float64},
+          instances::AbstractMatrix{U},
+          W::AbstractVector{Float64} = ones(size(labels,1));
           # default parameters
-          weights::Union{Dict{T, Float64}, Void}=nothing,
+          weights::Union{Dict{Float64, Float64}, Void}=nothing,
           solver_type::Cint=L2R_L2LOSS_SVC_DUAL,
-          eps::Real=Inf,
+          eps::Real=1e-2,
           C::Real=1.0,
           p::Real=0.1,
           # initial solutions for solvers L2R_LR, L2R_L2LOSS_SVC
@@ -209,19 +217,13 @@ function linear_train{T, U<:Real}(
           bias::Real=-1.0,
           verbose::Bool=false
           )
+
   eps = Float64(eps)
   C = Float64(C)
   p = Float64(p)
   bias = Float64(bias)
   global verbosity
   verbosity = verbose
-
-  eps = solver_type == L2R_LR || solver_type == L2R_L2LOSS_SVC ||
-        solver_type == L1R_L2LOSS_SVC || solver_type == L1R_LR ? 0.01 :
-        solver_type == L2R_L2LOSS_SVR ? 0.001 :
-        solver_type == L2R_L2LOSS_SVC_DUAL || solver_type == L2R_L1LOSS_SVC_DUAL ||
-        solver_type == MCSVM_CS || solver_type == L2R_LR_DUAL ||
-        solver_type == L2R_L2LOSS_SVR_DUAL || solver_type == L2R_L1LOSS_SVR_DUAL ? 0.1 : 0.001
 
   # instances are in columns
   nfeatures = size(instances, 1)
@@ -239,7 +241,12 @@ function linear_train{T, U<:Real}(
   # construct problem
   (nodes, nodeptrs) = instances2nodes(instances)
 
-  problem = Problem[Problem(Cint(size(instances, 2)), Cint(size(instances, 1)), pointer(idx), pointer(nodeptrs), bias)]
+  problem = Problem[Problem(Cint(size(instances, 2)), 
+                            Cint(size(instances, 1)), 
+                            pointer(labels), 
+                            pointer(nodeptrs), 
+                            bias, 
+                            pointer(W))]
 
   chk = ccall(check_parameter(), Ptr{UInt8}, (Ptr{Problem}, Ptr{Parameter}), problem, param)
 
@@ -249,12 +256,19 @@ function linear_train{T, U<:Real}(
 
   ptr = ccall(train(), Ptr{Model}, (Ptr{Problem}, Ptr{Parameter}), problem, param)
   m = pointer_to_array(ptr, 1)[1]
+  numSV = unsafe_load(m.numSV)
+  SVI = zeros(0)
+  SV = zeros(0)
+  if numSV != -1
+    SVI = pointer_to_array(m.SVI, numSV)
+    SV = pointer_to_array(m.SV, numSV)
+  end
   # extract w & _labels, notice they become safe after [:] operation
   w_dim = Int(m.nr_feature + (bias >= 0 ? 1 : 0))
   w_number = Int(m.nr_class == 2 && solver_type != MCSVM_CS ? 1 : m.nr_class)
   w = pointer_to_array(m.w, w_dim*w_number)[:]
   _labels = pointer_to_array(m.label, m.nr_class)[:]
-  model = LinearModel(solver_type, Int(m.nr_class), Int(m.nr_feature), w, _labels, reverse_labels, m.bias)
+  model = LinearModel(solver_type, Int(m.nr_class), Int(m.nr_feature), w, _labels, reverse_labels, m.bias, numSV, SV, SVI)
   ccall(free_model_content(), Void, (Ptr{Model},), ptr)
   
   model
@@ -266,6 +280,7 @@ function linear_predict{T, U<:Real}(
           instances::AbstractMatrix{U};
           probability_estimates::Bool=false,
           verbose::Bool=false)
+
   global verbosity
   verbosity = verbose
   # instances are in columns
@@ -280,8 +295,19 @@ function linear_predict{T, U<:Real}(
   end
   
   m = Array(Model, 1)
-  m[1] = Model(Parameter(model.solver_type, .0, .0, Cint(0), convert(Ptr{Cint}, C_NULL), convert(Ptr{Float64}, C_NULL), .0, convert(Ptr{Float64}, C_NULL)),
-        model.nr_class, model.nr_feature, pointer(model.w), pointer(model._labels), model.bias)
+
+  m[1] = Model(Parameter(model.solver_type, .0, 
+                        .0, Cint(0), 
+                        convert(Ptr{Cint}, C_NULL), convert(Ptr{Float64}, C_NULL), 
+                        .0, convert(Ptr{Float64}, C_NULL)),
+                        model.nr_class, 
+                        model.nr_feature, 
+                        pointer(model.w), 
+                        pointer(model._labels), 
+                        model.bias,
+                        convert(Ptr{Cint}, C_NULL),
+                        convert(Ptr{Cint}, C_NULL),
+                        convert(Ptr{Cint}, C_NULL))
 
   (nodes, nodeptrs) = instances2nodes(instances)
   class = Array(T, ninstances)
